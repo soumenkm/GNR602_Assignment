@@ -111,6 +111,83 @@ class EfficientGLCM:
                 val2 = self.rescaled_image[neighbor_r, neighbor_c].item()
                 glcm[val1, val2] += sign
 
+    def _calculate_glcm_for_window_efficient(self, r_start: int, c_start: int) -> torch.Tensor:
+        """
+        Calculates the GLCM from scratch for a specific window using vectorized operations.
+
+        Args:
+            r_start (int): Top row index of the window in the full rescaled image.
+            c_start (int): Left column index of the window in the full rescaled image.
+
+        Returns:
+            torch.Tensor: The GxG GLCM tensor for the window (int64), guaranteed symmetric.
+        """
+        # Ensure rescaled_image is available
+        if self.rescaled_image is None:
+             raise RuntimeError("Rescaled image not available. Call compute_glcms first or set self.rescaled_image.")
+
+        H, W = self.rescaled_image.shape
+        G = self.num_levels
+        WS = self.window_size
+
+        # 1. Extract the window from the rescaled image
+        r_end = r_start + WS
+        c_end = c_start + WS
+        # Ensure window boundaries are valid (should be handled by calling context, but check doesn't hurt)
+        if r_end > H or c_end > W:
+             raise ValueError(f"Window [{r_start}:{r_end}, {c_start}:{c_end}] exceeds image bounds ({H}x{W})")
+        window = self.rescaled_image[r_start:r_end, c_start:c_end] # Shape: (WS, WS)
+
+        # 2. Initialize the GLCM
+        # Use float32 for intermediate bincount accumulation if needed, then convert
+        glcm = torch.zeros((G, G), dtype=torch.int64, device=window.device) # Keep on same device
+
+        # 3. Iterate through each offset (vectorize the inner loops)
+        for dr, dc in self.offsets:
+            # Calculate slices for the two views corresponding to the offset
+            # View 1: Origin pixels
+            r1_start = max(0, -dr)
+            r1_end   = min(WS, WS - dr)
+            c1_start = max(0, -dc)
+            c1_end   = min(WS, WS - dc)
+
+            # View 2: Neighbor pixels (shifted by offset)
+            r2_start = max(0, dr)
+            r2_end   = min(WS, WS + dr)
+            c2_start = max(0, dc)
+            c2_end   = min(WS, WS + dc)
+
+            # Check if the slices are valid (have positive size)
+            if r1_start >= r1_end or c1_start >= c1_end:
+                continue # This offset doesn't produce valid pairs within the window
+
+            # Extract the overlapping views
+            view1 = window[r1_start:r1_end, c1_start:c1_end]
+            view2 = window[r2_start:r2_end, c2_start:c2_end]
+
+            # Flatten the views to get lists of values for pairs
+            vals1 = view1.flatten() # Shape: (N_pairs,)
+            vals2 = view2.flatten() # Shape: (N_pairs,)
+
+            # Ensure they have the same number of elements (should always be true if logic is correct)
+            assert vals1.shape == vals2.shape
+
+            # 4. Calculate linear indices for the pairs (val1, val2)
+            # linear_index = val1 * num_levels + val2
+            # Use long() for indices as bincount expects LongTensor indices
+            linear_indices = (vals1.long() * G + vals2.long())
+
+            # 5. Count occurrences of each linear index
+            # minlength ensures the output has size G*G, even if some pairs don't occur
+            pair_counts = torch.bincount(linear_indices, minlength=G * G)
+
+            # 6. Reshape counts into GxG matrix and add to the total GLCM
+            # View as GxG and add to the running total
+            glcm += pair_counts.view(G, G)
+
+        # The resulting GLCM is inherently symmetric because we included all symmetric offsets
+        # and counted pairs derived from them.
+        return glcm
 
     def _calculate_glcm_for_window(self, r_start: int, c_start: int) -> torch.Tensor:
         """
@@ -136,11 +213,11 @@ class EfficientGLCM:
                         val2 = self.rescaled_image[neighbor_r, neighbor_c].item()
                         glcm[val1, val2] += 1
         return glcm
-
+    
     def compute_glcms(self, image_item: Dict) -> torch.Tensor:
         """
-        Computes the GLCM for each pixel using an efficient sliding window.
-        Handles boundaries by only computing GLCMs where the full window fits (valid mode).
+        Computes the GLCM for each pixel using a sliding window.
+        This recalculates the GLCM from scratch for every window position.
 
         Args:
             image_item (Dict): A dictionary from MillionAIDataset containing 'gray_pixels'.
@@ -166,123 +243,129 @@ class EfficientGLCM:
 
         if out_H <= 0 or out_W <= 0:
              print(f"Warning: Window size ({self.window_size}) is larger than image dimensions ({H}x{W}). No GLCMs computed.")
+             # Return tensor with correct dimensions but size 0
              self.output_glcms = torch.zeros((0, 0, self.num_levels, self.num_levels), dtype=torch.int64)
              return self.output_glcms
 
         # Initialize the output tensor to store GLCMs for each valid center pixel
         glcms_array = torch.zeros((out_H, out_W, self.num_levels, self.num_levels), dtype=torch.int64)
 
-        # --- Efficient Sliding Window Calculation ---
-        print("Starting efficient GLCM computation...")
+        # --- Sliding Window Calculation ---
+        print("Starting GLCM computation...")
 
-        # 1. Calculate GLCM for the initial top-left window (0, 0)
-        current_glcm = self._calculate_glcm_for_window(0, 0)
-        glcms_array[0, 0] = current_glcm.clone() # Store a copy
+        # Iterate through all possible top-left corners (r_start, c_start) of the window
+        for r_start in tqdm.trange(out_H, desc="Rows", colour="yellow"):
+            for c_start in range(out_W):
+                # Calculate GLCM from scratch for the window starting at (r_start, c_start)
+                # Using the vectorized version for the single window calculation is still best practice
+                glcm = self._calculate_glcm_for_window_efficient(r_start, c_start)
 
-        # 2. Slide horizontally across the first row
-        # print("Processing first row...")
-        for c_win in tqdm.trange(1, out_W, desc="First Row", leave=False, colour="cyan"):
-            # Window moves from (0, c_win-1) to (0, c_win)
-            # Subtract contributions from the leftmost column leaving the window
-            leaving_c = c_win - 1
-            for r_win in range(self.window_size): # Iterate through rows within the column
-                r_img = r_win # Image row index
-                # Subtract pairs involving pixels at (r_img, leaving_c)
-                # Careful: Need to consider pairs where the neighbor was *inside* the old window
-                self._update_glcm_efficient(current_glcm, r_img, leaving_c, -1, 0, c_win-1)
-
-            # Add contributions from the rightmost column entering the window
-            entering_c = c_win + self.window_size - 1
-            for r_win in range(self.window_size): # Iterate through rows within the column
-                r_img = r_win # Image row index
-                # Add pairs involving pixels at (r_img, entering_c)
-                # Careful: Need to consider pairs where the neighbor is *inside* the new window
-                self._update_glcm_efficient(current_glcm, r_img, entering_c, +1, 0, c_win)
-
-            glcms_array[0, c_win] = current_glcm.clone()
-
-
-        # 3. Slide vertically and horizontally for subsequent rows
-        # print("Processing subsequent rows...")
-        # We need the GLCM from the window *above* to update vertically
-        glcm_above = torch.zeros_like(current_glcm) # Temp storage
-
-        for r_win in tqdm.trange(1, out_H, desc="Rows", colour="magenta"):
-            # --- Vertical Update for the first column ---
-            # Update from glcms_array[r_win-1, 0] to get glcms_array[r_win, 0]
-            glcm_above = glcms_array[r_win-1, 0] # Get the GLCM from the window directly above
-            current_glcm = glcm_above.clone() # Start with the GLCM from above
-
-            # Subtract contributions from the top row leaving the window
-            leaving_r = r_win - 1
-            for c_win_col0 in range(self.window_size): # Iterate through columns within the row
-                c_img = c_win_col0 # Image col index
-                # Subtract pairs involving pixel (leaving_r, c_img) relevant to the window ABOVE
-                self._update_glcm_efficient(current_glcm, leaving_r, c_img, -1, r_win - 1, 0)
-
-            # Add contributions from the bottom row entering the window
-            entering_r = r_win + self.window_size - 1
-            for c_win_col0 in range(self.window_size): # Iterate through columns within the row
-                c_img = c_win_col0 # Image col index
-                # Add pairs involving pixel (entering_r, c_img) relevant to the CURRENT window
-                self._update_glcm_efficient(current_glcm, entering_r, c_img, +1, r_win, 0)
-
-            glcms_array[r_win, 0] = current_glcm.clone() # Store GLCM for the first column of this row
-
-            # --- Horizontal Updates for the rest of the row ---
-            for c_win in range(1, out_W):
-                # Update horizontally from glcms_array[r_win, c_win-1]
-                # (using the GLCM we just stored or calculated)
-                # Subtract contributions from the leftmost column leaving the window
-                leaving_c = c_win - 1
-                for r_win_row in range(self.window_size):
-                    r_img = r_win + r_win_row
-                    self._update_glcm_efficient(current_glcm, r_img, leaving_c, -1, r_win, c_win - 1)
-
-                # Add contributions from the rightmost column entering the window
-                entering_c = c_win + self.window_size - 1
-                for r_win_row in range(self.window_size):
-                    r_img = r_win + r_win_row
-                    self._update_glcm_efficient(current_glcm, r_img, entering_c, +1, r_win, c_win)
-
-                glcms_array[r_win, c_win] = current_glcm.clone()
+                # Store the computed GLCM in the output array
+                # The index [r_start, c_start] corresponds to the window whose top-left is (r_start, c_start)
+                glcms_array[r_start, c_start] = glcm
 
         print("Finished GLCM computation.")
-        self.output_glcms = glcms_array
+        self.output_glcms = glcms_array # Store result
         return self.output_glcms
-
-    def _update_glcm_efficient(self, glcm: torch.Tensor, pixel_r: int, pixel_c: int, sign: int, win_r_start: int, win_c_start: int):
+    
+    def compute_glcms_efficient(self, image_item: Dict) -> torch.Tensor:
         """
-        Efficiently updates GLCM by considering pairs involving a specific pixel (pixel_r, pixel_c)
-        that is entering (+1) or leaving (-1) the calculation scope, ensuring the pairs
-        counted/removed are relevant to the window defined by (win_r_start, win_c_start).
+        Computes the GLCM for each pixel using a vectorized approach based on unfolding.
+        Effectively calculates the GLCM from scratch for every window simultaneously.
 
         Args:
-            glcm (torch.Tensor): The GxG GLCM tensor to update (int64).
-            pixel_r (int): Row index of the specific pixel entering/leaving.
-            pixel_c (int): Column index of the specific pixel.
-            sign (int): +1 if pixel is entering (add pairs), -1 if leaving (subtract pairs).
-            win_r_start (int): Starting row index of the relevant window boundary.
-            win_c_start (int): Starting column index of the relevant window boundary.
+            image_item (Dict): A dictionary containing 'gray_pixels'.
+                               Expected shape: (1, H, W), dtype uint8.
+
+        Returns:
+            torch.Tensor: A tensor containing the GLCM for each valid pixel center.
+                          Shape: (out_H, out_W, num_levels, num_levels), dtype int64.
         """
-        val1 = self.rescaled_image[pixel_r, pixel_c].item()
-        win_r_end = win_r_start + self.window_size
-        win_c_end = win_c_start + self.window_size
+        if 'gray_pixels' not in image_item:
+            raise ValueError("Input dictionary must contain 'gray_pixels' tensor.")
 
-        for dr, dc in self.offsets:
-            neighbor_r, neighbor_c = pixel_r + dr, pixel_c + dc
+        gray_tensor = image_item['gray_pixels']
+        self.original_shape = gray_tensor.shape
+        self.rescaled_image = self._rescale_image(gray_tensor) # Shape (H, W)
+        H, W = self.rescaled_image.shape
+        G = self.num_levels
+        WS = self.window_size
+        device = self.rescaled_image.device # Work on the same device
 
-            # Check if the neighbor is within the relevant window boundaries
-            if win_r_start <= neighbor_r < win_r_end and win_c_start <= neighbor_c < win_c_end:
-                 # Boundary check for image limits should implicitly be handled if window is valid
-                 # but double check doesn't hurt, though rescaled_image access handles it
-                 # if 0 <= neighbor_r < H and 0 <= neighbor_c < W: # H,W from self.rescaled_image.shape
-                val2 = self.rescaled_image[neighbor_r, neighbor_c].item()
-                glcm[val1, val2] += sign
-                # Note: This assumes the GLCM should be symmetric. If we only computed 4 offsets initially,
-                # we would need to add glcm[val2, val1] += sign here as well.
-                # Since we calculated 8 offsets, symmetry is implicitly handled IF the offset list is symmetric.
+        # Calculate output dimensions
+        out_H = H - WS + 1
+        out_W = W - WS + 1
 
+        if out_H <= 0 or out_W <= 0:
+             print(f"Warning: Window size ({WS}) > image dimensions ({H}x{W}). No GLCMs computed.")
+             self.output_glcms = torch.zeros((0, 0, G, G), dtype=torch.int64, device=device)
+             return self.output_glcms
+
+        # --- Vectorized Calculation using unfold and scatter_add_ ---
+        print("Starting Efficient GLCM computation...")
+
+        # 1. Create sliding window views of the rescaled image
+        # Unfold along rows (dimension 0)
+        unfolded_rows = self.rescaled_image.unfold(0, WS, 1) # Shape: (out_H, W, WS)
+        # Unfold along columns (dimension 1 of the *result* from above)
+        # Note: unfold dimension indexes the dimension *of the tensor it's called on*
+        all_windows = unfolded_rows.unfold(1, WS, 1) # Shape: (out_H, out_W, WS, WS)
+
+        # Ensure the unfolded view is contiguous in memory for efficiency later if needed
+        all_windows = all_windows.contiguous()
+
+        # 2. Initialize the final GLCM tensor
+        glcms_array = torch.zeros((out_H, out_W, G, G), dtype=torch.int64, device=device)
+
+        # 3. Iterate through offsets (vectorize calculations *within* each offset)
+        for dr, dc in tqdm.tqdm(self.offsets, desc="Vectorized Offsets", colour="blue", leave=False):
+            # Calculate slices within the WS x WS window
+            r1_start, r1_end = max(0, -dr), min(WS, WS - dr)
+            c1_start, c1_end = max(0, -dc), min(WS, WS - dc)
+            r2_start, r2_end = max(0, dr), min(WS, WS + dr)
+            c2_start, c2_end = max(0, dc), min(WS, WS + dc)
+
+            # Check if the slices are valid
+            if r1_start >= r1_end or c1_start >= c1_end:
+                continue # No valid pairs for this offset within any window
+
+            # Extract the two views *across all windows* simultaneously
+            # all_windows has shape (out_H, out_W, WS, WS)
+            all_views1 = all_windows[:, :, r1_start:r1_end, c1_start:c1_end]
+            all_views2 = all_windows[:, :, r2_start:r2_end, c2_start:c2_end]
+            # Shape of views: (out_H, out_W, H_view, W_view) where H_view/W_view depend on slices
+
+            # Flatten the window dimensions (H_view, W_view) to get pairs for each window
+            # Shape becomes (out_H, out_W, N_pairs) where N_pairs = H_view * W_view
+            all_vals1 = all_views1.reshape(out_H, out_W, -1)
+            all_vals2 = all_views2.reshape(out_H, out_W, -1)
+
+            # Calculate linear indices for all pairs across all windows
+            # Shape: (out_H, out_W, N_pairs)
+            all_linear_indices = (all_vals1.long() * G + all_vals2.long())
+
+            # Use scatter_add_ for efficient counting across all windows for this offset
+            # We need a temporary tensor to accumulate counts for this specific offset
+            # Shape: (out_H, out_W, G*G)
+            offset_glcm_flat = torch.zeros(out_H, out_W, G * G, dtype=torch.int64, device=device)
+
+            # scatter_add_ needs source tensor of same shape as index, containing values to add (here, all 1s)
+            src = torch.ones_like(all_linear_indices, dtype=torch.int64)
+
+            # Perform the scatter operation along the last dimension (dim=2)
+            # index=all_linear_indices tells scatter_add_ *which* position in the G*G dimension to increment
+            offset_glcm_flat.scatter_add_(dim=2, index=all_linear_indices, src=src)
+
+            # Reshape the flat offset GLCMs back to (out_H, out_W, G, G)
+            offset_glcm = offset_glcm_flat.view(out_H, out_W, G, G)
+
+            # Add the contribution from this offset to the total GLCM array
+            glcms_array += offset_glcm
+
+        print("Finished Efficient GLCM computation.")
+        self.output_glcms = glcms_array # Store result
+        return self.output_glcms # (H - WS + 1, W - WS + 1, G, G)
+    
 # --- Example Usage ---
 if __name__ == "__main__":
     # Assume you have a MillionAIDataset instance 'train_dataset'
@@ -308,7 +391,7 @@ if __name__ == "__main__":
     # --- Process the dummy image ---
     print(f"Processing image with shape: {dummy_item['gray_pixels'].shape}")
     start_time = datetime.datetime.now()
-    output_glcm_tensor = glcm_calculator.compute_glcms(dummy_item)
+    output_glcm_tensor = glcm_calculator.compute_glcms_efficient(dummy_item)
     end_time = datetime.datetime.now()
     print(f"GLCM computation took: {end_time - start_time}")
 
@@ -318,23 +401,13 @@ if __name__ == "__main__":
     # e.g., (512 - 7 + 1, 512 - 7 + 1, 5, 5) -> (506, 506, 5, 5)
 
     if output_glcm_tensor.numel() > 0:
-         # Check a sample GLCM (e.g., for the center pixel of the output)
-         center_h = output_glcm_tensor.shape[0] // 2
-         center_w = output_glcm_tensor.shape[1] // 2
-         sample_glcm = output_glcm_tensor[center_h, center_w]
-         print(f"\nSample GLCM at output center ({center_h}, {center_w}):")
-         print(sample_glcm)
+        # Check a sample GLCM (e.g., for the center pixel of the output)
+        center_h = output_glcm_tensor.shape[0] // 2
+        center_w = output_glcm_tensor.shape[1] // 2
+        sample_glcm = output_glcm_tensor[center_h, center_w]
+        print(f"\nSample GLCM at output center ({center_h}, {center_w}):")
+        print(sample_glcm)
 
-         # Verify symmetry (optional)
-         is_symmetric = torch.all(sample_glcm == sample_glcm.t())
-         print(f"Is the sample GLCM symmetric? {is_symmetric}") # Should be true
-
-         # Verify counts (optional, harder to predict exactly)
-         # Sum of GLCM elements should be the number of pairs counted in that window
-         print(f"Sum of sample GLCM elements: {torch.sum(sample_glcm)}")
-         # Expected sum = window_size * window_size * num_offsets_used (approx)
-         # num_offsets_used depends on how many unique (dr, dc) pairs were generated.
-         print(f"Number of offsets used (symmetric): {len(glcm_calculator.offsets)}")
-
-    # You would typically proceed to calculate features (like eigenvalues)
-    # from each GxG matrix in the output_glcm_tensor.
+        # Verify symmetry (optional)
+        is_symmetric = torch.all(sample_glcm == sample_glcm.t())
+        print(f"Is the sample GLCM symmetric? {is_symmetric}") # Should be true
