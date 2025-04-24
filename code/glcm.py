@@ -1,8 +1,11 @@
 import torch, datetime
 import tqdm
 import numpy as np
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from dataset import MillionAIDataset 
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from pathlib import Path
 
 class EfficientGLCM:
     """
@@ -13,7 +16,8 @@ class EfficientGLCM:
                  num_levels: int = 5,
                  window_size: int = 5,
                  distance: int = 1,
-                 angles: List[float] = [0, np.pi/4, np.pi/2, 3*np.pi/4] # Radians for calculation
+                 angles: List[float] = [0, np.pi/4, np.pi/2, 3*np.pi/4], # Radians for calculation
+                 output_dir: str = "output/glcms"
                  ):
         """
         Initializes the GLCM calculator parameters.
@@ -43,9 +47,17 @@ class EfficientGLCM:
         self.offsets = self._calculate_offsets(distance, angles)
 
         # Internal state, will be set when process_image is called
+        self.rgb_image = None
+        self.gray_image = None
         self.original_shape = None
         self.rescaled_image = None
         self.output_glcms = None # Shape: (H, W, num_levels, num_levels) or smaller if valid mode
+        self.eigenvalue_maps = None # Shape: (H, W, num_levels) for eigenvalues
+        
+        # Setup output path
+        self.output_dir = Path.cwd() / output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True) # Create output directory if it doesn't exist
+        print(f"Output dir for visualized GLCM feature images: {self.output_dir}")
 
     def _calculate_offsets(self, distance: int, angles: List[float]) -> List[Tuple[int, int]]:
         """Calculates (dr, dc) offsets for given distances and angles."""
@@ -285,6 +297,8 @@ class EfficientGLCM:
             raise ValueError("Input dictionary must contain 'gray_pixels' tensor.")
 
         gray_tensor = image_item['gray_pixels']
+        self.rgb_image = image_item['rgb_pixels'] # Keep original image if needed
+        self.gray_image = gray_tensor # Keep original gray image if needed
         self.original_shape = gray_tensor.shape
         self.rescaled_image = self._rescale_image(gray_tensor) # Shape (H, W)
         H, W = self.rescaled_image.shape
@@ -364,16 +378,223 @@ class EfficientGLCM:
 
         print("Finished Efficient GLCM computation.")
         self.output_glcms = glcms_array # Store result
+        
         return self.output_glcms # (H - WS + 1, W - WS + 1, G, G)
     
+    def _normalize_glcms(self, glcm_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Normalizes the GLCM tensor (batch) so each GxG matrix sums to 1 (or 0 if sum is 0).
+
+        Args:
+            glcm_tensor (Optional[torch.Tensor]): The GLCM tensor to normalize,
+                shape (H, W, G, G). If None, uses self.output_glcms.
+
+        Returns:
+            torch.Tensor: The normalized GLCM tensor, shape (H, W, G, G), dtype float32.
+        """
+        if glcm_tensor is None:
+            if self.output_glcms is None:
+                raise ValueError("No GLCM tensor provided and self.output_glcms is None.")
+            glcm_tensor = self.output_glcms
+
+        # Ensure float type for division
+        glcm_float = glcm_tensor.float()
+
+        # Calculate sum for each GxG matrix
+        glcm_sum = torch.sum(glcm_float, dim=(-2, -1), keepdim=True)
+
+        # Normalize, adding epsilon to denominator for stability
+        normalized_glcms = glcm_float / (glcm_sum + 1e-9)
+
+        return normalized_glcms
+    
+    def extract_eigenvalue_features(self, glcm_tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Computes eigenvalues for each normalized GLCM in the batch.
+
+        Args:
+            glcm_tensor (Optional[torch.Tensor]): The raw GLCM count tensor,
+                shape (H, W, G, G). If None, uses self.output_glcms.
+
+        Returns:
+            torch.Tensor: Tensor of sorted eigenvalues (descending) for each window.
+                          Shape: (H, W, G), dtype float32/complex64 (typically float32 for eigvalsh).
+                          Stores the result in self.eigenvalue_maps.
+        """
+        if glcm_tensor is None:
+            if self.output_glcms is None:
+                raise ValueError("No GLCM tensor provided and self.output_glcms is None.")
+            glcm_tensor = self.output_glcms
+            
+        if glcm_tensor.numel() == 0:
+             print("Warning: Input GLCM tensor is empty. Returning empty eigenvalues.")
+             self.eigenvalue_maps = torch.empty((0, 0, self.num_levels), dtype=torch.float32, device=glcm_tensor.device)
+             return self.eigenvalue_maps
+
+        # 1. Normalize the GLCMs
+        normalized_glcms = self._normalize_glcms(glcm_tensor) # Shape (H, W, G, G), float
+
+        # 2. Compute Eigenvalues
+        # Use eigvalsh for real symmetric matrices (our normalized GLCMs should be)
+        # This returns only eigenvalues, and they are real.
+        try:
+            # Ensure the tensor is on the CPU for eigvalsh if necessary, or check GPU support
+            # Depending on PyTorch version and hardware, eigvalsh might need CPU tensor.
+            eigenvalues = torch.linalg.eigvalsh(normalized_glcms.cpu()).to(normalized_glcms.device)
+            # Shape: (H, W, G)
+        except Exception as e:
+             print(f"Error during eigenvalue computation: {e}")
+             print("Ensure input matrices are Hermitian (symmetric for real). Check for NaNs/Infs.")
+             # Handle potential errors, maybe return NaNs or zeros
+             eigenvalues = torch.full_like(normalized_glcms[..., 0], float('nan'))
+
+        # 3. Sort eigenvalues in descending order
+        # torch.sort returns values and indices, we only need values
+        sorted_eigenvalues, _ = torch.sort(eigenvalues, dim=-1, descending=True)
+
+        # Replace potential NaNs introduced by eigvalsh on zero matrices (if normalization failed)
+        # Eigvalsh of a zero matrix yields zeros. If normalization failed, it might be NaN.
+        sorted_eigenvalues = torch.nan_to_num(sorted_eigenvalues, nan=0.0)
+
+        self.eigenvalue_maps = sorted_eigenvalues # Store result
+        return self.eigenvalue_maps # Shape: (H, W, G), dtype float32
+    
+    def visualize_all(self,
+                      index: int,
+                      rgb_image_tensor: Optional[torch.Tensor] = None,
+                      eigenvalue_maps: Optional[torch.Tensor] = None,
+                      rescaled_image: Optional[torch.Tensor] = None
+        ) -> None:
+        """
+        Visualizes the original RGB image, the rescaled grayscale image used for GLCM,
+        and all computed eigenvalue maps in a single figure.
+
+        Args:
+            index (int): The index of the image in the dataset for labeling.
+            rgb_image_tensor (Optional[torch.Tensor]): The original RGB image tensor, expected shape
+                                            (3, H_orig, W_orig), dtype uint8.
+            eigenvalue_maps (Optional[torch.Tensor]): The computed eigenvalues tensor,
+                shape (H_out, W_out, G). If None, uses self.eigenvalue_maps.
+            rescaled_image (Optional[torch.Tensor]): The rescaled grayscale image tensor,
+                shape (H_orig, W_orig) or (1, H_orig, W_orig), dtype uint8. If None,
+                uses self.rescaled_image.
+        """
+        # --- Input Validation and Data Preparation ---
+        if rgb_image_tensor is None:
+            if self.rgb_image is None:
+                print("Error: No rgb_image_tensor provided.")
+                return
+            rgb_image_tensor = self.rgb_image
+        if eigenvalue_maps is None:
+            if self.eigenvalue_maps is None:
+                print("Error: No eigenvalue maps provided or computed yet (self.eigenvalue_maps is None).")
+                return
+            eigenvalue_maps = self.eigenvalue_maps
+
+        if rescaled_image is None:
+            if self.gray_image is None:
+                print("Error: No rescaled grayscale image provided or available (self.rescaled_image is None).")
+                return
+            rescaled_image = self.gray_image
+
+        if eigenvalue_maps.numel() == 0:
+            print("Cannot visualize empty eigenvalue maps.")
+            return
+        if rescaled_image.numel() == 0:
+            print("Cannot visualize empty rescaled image.")
+            return
+
+        # Prepare images for plotting (move to CPU, convert to NumPy, adjust dims)
+        rgb_np = rgb_image_tensor.permute(1, 2, 0).cpu().numpy() # H, W, C
+
+        if rescaled_image.dim() == 3 and rescaled_image.shape[0] == 1:
+            gray_np = rescaled_image.squeeze(0).cpu().numpy() # H, W
+        elif rescaled_image.dim() == 2:
+            gray_np = rescaled_image.cpu().numpy() # H, W
+        else:
+             raise ValueError("rescaled_image should have shape (H, W) or (1, H, W)")
+
+        H_out, W_out, G = eigenvalue_maps.shape
+        eigen_maps_np = eigenvalue_maps.cpu().numpy() # H_out, W_out, G
+
+        # --- Layout Calculation ---
+        num_eigen_maps = G
+        num_total_plots = 2 + num_eigen_maps # RGB + Gray + G maps
+
+        cols = int(np.ceil(np.sqrt(num_total_plots)))
+        rows = int(np.ceil(num_total_plots / cols))
+
+        # --- Plotting ---
+        fig = plt.figure(figsize=(cols * 4, rows * 4))
+        # Create gridspec: rows, cols define the grid shape
+        gs = gridspec.GridSpec(rows, cols, figure=fig)
+
+        plot_count = 0
+
+        # Plot Original RGB
+        ax_rgb = fig.add_subplot(gs[plot_count])
+        ax_rgb.imshow(rgb_np)
+        ax_rgb.set_title("Original RGB")
+        ax_rgb.set_xticks([])
+        ax_rgb.set_yticks([])
+        plot_count += 1
+
+        # Plot Rescaled Grayscale
+        ax_gray = fig.add_subplot(gs[plot_count])
+        ax_gray.imshow(gray_np, cmap='gray')
+        ax_gray.set_title(f"Rescaled Gray (G={self.num_levels})")
+        ax_gray.set_xticks([])
+        ax_gray.set_yticks([])
+        plot_count += 1
+
+        # Plot Eigenvalue Maps
+        for k in range(num_eigen_maps):
+            if plot_count >= rows * cols: break # Should not happen with correct layout calc
+
+            ax_eigen = fig.add_subplot(gs[plot_count])
+            eigen_map_k = eigen_maps_np[:, :, k]
+
+            im = ax_eigen.imshow(eigen_map_k, cmap='viridis') # Choose a suitable colormap
+            title = f"Eigenvalue {k+1}"
+            if k == 0: title += " (Largest)"
+            if k == G - 1: title += " (Smallest)"
+            ax_eigen.set_title(title)
+            ax_eigen.set_xticks([])
+            ax_eigen.set_yticks([])
+            plt.colorbar(im, ax=ax_eigen, fraction=0.046, pad=0.04)
+            plot_count += 1
+
+        # Hide any unused subplots in the grid
+        while plot_count < rows * cols:
+            fig.add_subplot(gs[plot_count]).axis('off')
+            plot_count += 1
+
+        # --- Final Touches & Saving ---
+        suptitle = f"Input Images & Eigenvalue Maps (G={self.num_levels}, WS={self.window_size}, Dist={self.distance})"
+        fig.suptitle(suptitle, fontsize=14)
+
+        # Adjust layout to prevent title overlap
+        fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+        # Construct save path
+        save_filename = f"visualization_idx_{index}_G{self.num_levels}_WS{self.window_size}.png"
+        final_save_path = self.output_dir / save_filename
+
+        try:
+            plt.savefig(final_save_path)
+            print(f"Combined visualization saved to {final_save_path}")
+        except Exception as e:
+            print(f"Error saving figure to {final_save_path}: {e}")
+        plt.close(fig) # Close figure to free memory
+       
 # --- Example Usage ---
 if __name__ == "__main__":
     # Assume you have a MillionAIDataset instance 'train_dataset'
-    # Create a dummy dataset item for testing
-    dummy_rgb = torch.randint(0, 256, (3, 512, 512), dtype=torch.uint8)
-    dummy_gray = torch.randint(0, 256, (1, 512, 512), dtype=torch.uint8) # Use a dummy grayscale
-    dummy_item = {"rgb_pixels": dummy_rgb, "gray_pixels": dummy_gray, "labels": "dummy_label"}
+    train_dataset = MillionAIDataset(frac=0.001, is_train=True, output_dir="output/images")
 
+    # Create a dummy dataset item for testing
+    data_item = train_dataset[0]
+    
     # --- Configuration ---
     NUM_LEVELS = 5
     WINDOW_SIZE = 7 # Must be odd
@@ -388,10 +609,12 @@ if __name__ == "__main__":
         angles=ANGLES
     )
 
-    # --- Process the dummy image ---
-    print(f"Processing image with shape: {dummy_item['gray_pixels'].shape}")
+    # --- Process the data image ---
+    print(f"Processing image with shape: {data_item['gray_pixels'].shape}")
     start_time = datetime.datetime.now()
-    output_glcm_tensor = glcm_calculator.compute_glcms_efficient(dummy_item)
+    output_glcm_tensor = glcm_calculator.compute_glcms_efficient(data_item)
+    glcm_calculator.extract_eigenvalue_features()
+    glcm_calculator.visualize_all(index=0)
     end_time = datetime.datetime.now()
     print(f"GLCM computation took: {end_time - start_time}")
 
