@@ -282,7 +282,7 @@ if __name__ == "__main__":
     WINDOW_SIZE = 7
     DISTANCE = 1
     ANGLES = [0, np.pi/4, np.pi/2, 3*np.pi/4]
-    NUM_CLUSTERS = 4 # Example K value
+    NUM_CLUSTERS = 6 # Example K value
 
     # --- GLCM Part ---
     glcm_calculator = EfficientGLCM(
