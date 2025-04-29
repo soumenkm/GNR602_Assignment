@@ -15,52 +15,95 @@ import matplotlib.pyplot as plt
 torch.manual_seed(42)
 
 class MillionAIDataset(Dataset):
+    """
+    PyTorch Dataset class for loading and processing a fraction of the Million-AID dataset.
+
+    Handles loading from Hugging Face datasets library, splitting into train/test subsets,
+    applying image transformations (resize, crop), converting images to RGB and grayscale
+    PyTorch tensors with pixel values in the [0, 255] range (uint8), and filtering
+    out images exceeding a maximum pixel count. Also includes visualization functionality.
+
+    Attributes:
+        is_train (bool): If True, loads the training subset, otherwise loads the test subset.
+        frac (float): The fraction of the total dataset to load and process.
+        max_pixels (int): The maximum allowed number of pixels (width * height) for an image
+                          to be included in the dataset. Images larger than this are skipped.
+        output_path (Path): Path object representing the directory where visualizations are saved.
+        ntsc_weights (torch.Tensor): Tensor containing NTSC weights for grayscale conversion.
+        transform_rgb (transforms.Compose): Composition of torchvision transforms applied
+                                            to the loaded PIL images to get RGB tensors.
+        ds (List[dict]): The final processed list of data items (dictionaries), either
+                         for the training or testing split. Each dictionary contains
+                         'rgb_pixels', 'gray_pixels', and 'labels'.
+    """
     def __init__(self, frac: float, is_train: bool, max_pixels: int = 89478485, output_dir: str = "output/images") -> None:
+        """
+        Initializes the MillionAIDataset instance.
+
+        Args:
+            frac (float): Fraction of the full dataset to use (e.g., 0.01 for 1%).
+            is_train (bool): True to prepare the training set, False for the test set.
+            max_pixels (int): Maximum number of pixels (width * height) allowed per image.
+            output_dir (str): Directory path to save visualized images.
+        """
         super(MillionAIDataset, self).__init__()
         self.is_train = is_train
         self.frac = frac
         self.max_pixels = max_pixels
-        # Define NTSC weights for grayscale conversion
-        self.ntsc_weights = torch.tensor([0.299, 0.587, 0.114]).view(3, 1, 1) # Reshape for broadcasting (C, H, W)
-
-        # The transform pipeline will resize, crop, and convert RGB to tensor [0, 255]
+        self.ntsc_weights = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32).view(3, 1, 1)
         self.transform_rgb = self._get_rgb_transform()
-
-        # Setup output path
         self.output_path = Path.cwd() / output_dir
-        self.output_path.mkdir(parents=True, exist_ok=True) # Create output directory if it doesn't exist
+        self.output_path.mkdir(parents=True, exist_ok=True)
         print(f"Output path for visualized images: {self.output_path}")
-
-        # Load and prepare the dataset subset (train or test)
         self.ds = self._get_dataset()
 
     def _get_rgb_transform(self) -> transforms.Compose:
-        # Transforms applied BEFORE grayscale conversion
-        # Outputs RGB tensor [0, 255], uint8
+        """
+        Defines the sequence of transformations applied to PIL images to obtain
+        resized, cropped, and tensorized RGB images.
+
+        Returns:
+            transforms.Compose: The transformation pipeline. Resulting tensors are
+                                uint8 with shape (3, H, W) and range [0, 255].
+        """
         return transforms.Compose([
-            transforms.Resize(512),              # Resize smaller dimension to 512
-            transforms.CenterCrop(512),          # Crop center 512x512
-            transforms.PILToTensor(),            # Convert PIL Image to Tensor (C, H, W) in [0, 255], uint8
+            transforms.Resize(512),
+            transforms.CenterCrop(512),
+            transforms.PILToTensor(),
         ])
 
     def _calculate_grayscale(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
-        """Calculates grayscale tensor using NTSC weights."""
-        # Ensure input is float for weighted sum
+        """
+        Converts an RGB tensor to a grayscale tensor using NTSC standard weights.
+
+        Args:
+            rgb_tensor (torch.Tensor): Input RGB tensor, expected shape (3, H, W) and dtype uint8.
+
+        Returns:
+            torch.Tensor: Output grayscale tensor, shape (1, H, W) and dtype uint8, range [0, 255].
+        """
         rgb_float = rgb_tensor.float()
-        # Apply NTSC weights: (3, H, W) * (3, 1, 1) -> sum over C -> (1, H, W)
         gray_float = torch.sum(rgb_float * self.ntsc_weights, dim=0, keepdim=True)
-        # Convert back to uint8, clamping values just in case of minor floating point inaccuracies
-        gray_tensor = gray_float.round().clamp(0, 255).byte() # .byte() is equivalent to .to(torch.uint8)
-        return gray_tensor # Shape (1, H, W), dtype uint8
+        gray_tensor = gray_float.round().clamp(0, 255).byte()
+        return gray_tensor
 
     def _get_dataset(self) -> List[dict]:
-        # Load the specified split from Hugging Face datasets
+        """
+        Loads the dataset from Hugging Face, selects a fraction, shuffles, splits into
+        train/test, applies transformations, converts to grayscale, filters by size,
+        and returns the appropriate subset as a list of dictionaries.
+
+        Returns:
+            List[dict]: A list containing the processed data items for the specified
+                        split (train or test). Each item is a dictionary:
+                        {'rgb_pixels': torch.Tensor, 'gray_pixels': torch.Tensor, 'labels': any}.
+        """
         print("Loading Million-AID dataset from Hugging Face...")
         try:
             full_ds = load_dataset("jonathan-roberts1/Million-AID", split="train")
         except Exception as e:
-             print(f"Error loading dataset. Ensure you have internet connection and 'datasets' library is updated.")
-             print(f"If you are offline, ensure the dataset is cached.")
+             print(f"Error loading dataset. Ensure internet connection and updated 'datasets' library.")
+             print(f"If offline, ensure dataset is cached.")
              print(f"Error details: {e}")
              sys.exit(1)
 
@@ -69,7 +112,7 @@ class MillionAIDataset(Dataset):
         print(f"Using {length} images ({self.frac*100:.2f}% of total)...")
         subset_ds = full_ds.select(range(length)).shuffle(seed=42)
 
-        size = int(len(subset_ds) * 0.8) # 80% train, 20% test
+        size = int(len(subset_ds) * 0.8)
         processed_ds = []
 
         if self.is_train:
@@ -90,13 +133,8 @@ class MillionAIDataset(Dataset):
                     continue
 
                 if image_pil.size[0] * image_pil.size[1] <= self.max_pixels:
-                    # Apply transformations to get RGB tensor
-                    rgb_tensor = self.transform_rgb(image_pil) # Shape (3, H, W), uint8 [0, 255]
-
-                    # Calculate grayscale tensor from RGB tensor
-                    gray_tensor = self._calculate_grayscale(rgb_tensor) # Shape (1, H, W), uint8 [0, 255]
-
-                    # Append dictionary with both tensors and the label
+                    rgb_tensor = self.transform_rgb(image_pil)
+                    gray_tensor = self._calculate_grayscale(rgb_tensor)
                     processed_ds.append({
                         "rgb_pixels": rgb_tensor,
                         "gray_pixels": gray_tensor,
@@ -109,51 +147,60 @@ class MillionAIDataset(Dataset):
         return processed_ds
 
     def __len__(self) -> int:
+        """
+        Returns the number of items in the processed dataset split.
+
+        Returns:
+            int: The total number of samples in the dataset.
+        """
         return len(self.ds)
 
     def __getitem__(self, index: int) -> dict:
-        # Returns {'rgb_pixels': tensor, 'gray_pixels': tensor, 'labels': label}
+        """
+        Retrieves a specific processed data item by index.
+
+        Args:
+            index (int): The index of the data item to retrieve.
+
+        Returns:
+            dict: A dictionary containing the 'rgb_pixels' tensor, 'gray_pixels' tensor,
+                  and the 'labels' for the requested item.
+        """
         return self.ds[index]
 
     def visualize_image(self, index: int):
         """
-        Visualizes the RGB and Grayscale images side-by-side for the given index
-        and saves the figure to the output directory.
+        Displays the RGB and Grayscale versions of the image at the specified index
+        side-by-side using Matplotlib and saves the figure to the output directory.
+
+        Args:
+            index (int): The index of the dataset item to visualize.
         """
         if index >= len(self.ds):
             print(f"Error: Index {index} out of bounds for dataset size {len(self.ds)}.")
             return
 
-        # Get the data dictionary
         item = self.ds[index]
-        rgb_tensor = item["rgb_pixels"]   # Shape (3, H, W), uint8 [0, 255]
-        gray_tensor = item["gray_pixels"] # Shape (1, H, W), uint8 [0, 255]
+        rgb_tensor = item["rgb_pixels"]
+        gray_tensor = item["gray_pixels"]
         label = item["labels"]
 
-        # --- Convert tensors for matplotlib display ---
-        # RGB: Needs (H, W, C)
         rgb_numpy = rgb_tensor.permute(1, 2, 0).numpy()
-        # Grayscale: Needs (H, W)
-        gray_numpy = gray_tensor.squeeze(0).numpy() # Remove channel dim
+        gray_numpy = gray_tensor.squeeze(0).numpy()
 
-        # --- Create figure with two subplots ---
-        fig, axes = plt.subplots(1, 2, figsize=(12, 6)) # 1 row, 2 columns
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
 
-        # Plot RGB
         axes[0].imshow(rgb_numpy)
         axes[0].set_title("RGB")
         axes[0].axis('off')
 
-        # Plot Grayscale
-        axes[1].imshow(gray_numpy, cmap='gray') # Use grayscale colormap
+        axes[1].imshow(gray_numpy, cmap='gray')
         axes[1].set_title("Grayscale (NTSC)")
         axes[1].axis('off')
 
-        # Add overall title
         plt.suptitle(f"Image Index: {index}\nLabel: {label}", fontsize=12)
-        fig.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
+        fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-        # --- Save the figure ---
         save_path = self.output_path / f"image_{index}_comparison.png"
         try:
             plt.savefig(save_path)
@@ -161,36 +208,28 @@ class MillionAIDataset(Dataset):
         except Exception as e:
             print(f"Error saving figure to {save_path}: {e}")
 
-        # Close the plot figure to free memory, especially if calling this in a loop
         plt.close(fig)
 
 
 if __name__ == "__main__":
-    # Create the training dataset instance (using 0.1% of the data for speed)
     train_dataset = MillionAIDataset(frac=0.001, is_train=True, output_dir="output/images")
 
-    # Check if the dataset was loaded successfully
     if len(train_dataset) > 0:
-        # Get the first item
         first_item = train_dataset[0]
         rgb_tensor = first_item["rgb_pixels"]
         gray_tensor = first_item["gray_pixels"]
         label = first_item["labels"]
 
-        # Print information about the first item's tensors
         print("\n--- First Item Details ---")
         print(f"Label: {label}")
         print(f"RGB Tensor shape: {rgb_tensor.shape}, dtype: {rgb_tensor.dtype}, Min: {torch.min(rgb_tensor)}, Max: {torch.max(rgb_tensor)}")
         print(f"Grayscale Tensor shape: {gray_tensor.shape}, dtype: {gray_tensor.dtype}, Min: {torch.min(gray_tensor)}, Max: {torch.max(gray_tensor)}")
 
-        # Visualize the first image (RGB and Grayscale)
         print("\nVisualizing the first image...")
         train_dataset.visualize_image(0)
 
-        # Example: Visualize another image if available
         if len(train_dataset) > 5:
              print("\nVisualizing image at index 5...")
              train_dataset.visualize_image(5)
     else:
         print("Dataset is empty. Check the fraction used or potential loading errors.")
-
